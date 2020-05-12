@@ -37,8 +37,8 @@ import java.util.Map;
 import java.util.UUID;
 import javax.annotation.Nullable;
 import javax.inject.Inject;
+import javax.inject.Named;
 import lombok.Getter;
-import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
@@ -48,9 +48,11 @@ import net.runelite.api.Skill;
 import net.runelite.api.SoundEffectID;
 import net.runelite.api.Tile;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.CommandExecuted;
 import net.runelite.api.events.FocusChanged;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.MenuOptionClicked;
+import net.runelite.client.callback.ClientThread;
 import net.runelite.client.chat.ChatColorType;
 import net.runelite.client.chat.ChatMessageBuilder;
 import net.runelite.client.chat.ChatMessageManager;
@@ -84,7 +86,6 @@ import net.runelite.http.api.ws.messages.party.UserSync;
 	name = "Party",
 	description = "Shows useful information about current party"
 )
-@Slf4j
 public class PartyPlugin extends Plugin implements KeyListener
 {
 	@Inject
@@ -119,6 +120,13 @@ public class PartyPlugin extends Plugin implements KeyListener
 
 	@Inject
 	private ChatMessageManager chatMessageManager;
+
+	@Inject
+	private ClientThread clientThread;
+
+	@Inject
+	@Named("developerMode")
+	boolean developerMode;
 
 	@Getter
 	private final Map<UUID, PartyData> partyDataMap = Collections.synchronizedMap(new HashMap<>());
@@ -191,7 +199,7 @@ public class PartyPlugin extends Plugin implements KeyListener
 				.build();
 
 			chatMessageManager.queue(QueuedMessage.builder()
-				.type(ChatMessageType.CLANCHAT_INFO)
+				.type(ChatMessageType.FRIENDSCHATNOTIFICATION)
 				.runeLiteFormattedMessage(leaveMessage)
 				.build());
 		}
@@ -256,7 +264,7 @@ public class PartyPlugin extends Plugin implements KeyListener
 				return;
 			}
 
-			client.playSoundEffect(SoundEffectID.SMITH_ANVIL_TINK);
+			clientThread.invoke(() -> client.playSoundEffect(SoundEffectID.SMITH_ANVIL_TINK));
 		}
 	}
 
@@ -381,7 +389,7 @@ public class PartyPlugin extends Plugin implements KeyListener
 			.build();
 
 		chatMessageManager.queue(QueuedMessage.builder()
-			.type(ChatMessageType.CLANCHAT_INFO)
+			.type(ChatMessageType.FRIENDSCHATNOTIFICATION)
 			.runeLiteFormattedMessage(joinMessage)
 			.build());
 
@@ -430,7 +438,7 @@ public class PartyPlugin extends Plugin implements KeyListener
 					.build();
 
 				chatMessageManager.queue(QueuedMessage.builder()
-					.type(ChatMessageType.CLANCHAT_INFO)
+					.type(ChatMessageType.FRIENDSCHATNOTIFICATION)
 					.runeLiteFormattedMessage(joinMessage)
 					.build());
 			}
@@ -446,6 +454,23 @@ public class PartyPlugin extends Plugin implements KeyListener
 		partyDataMap.clear();
 		pendingTilePings.clear();
 		worldMapManager.removeIf(PartyWorldMapPoint.class::isInstance);
+	}
+
+	@Subscribe
+	public void onCommandExecuted(CommandExecuted commandExecuted)
+	{
+		if (!developerMode || !commandExecuted.getCommand().equals("partyinfo"))
+		{
+			return;
+		}
+
+		chatMessageManager.queue(QueuedMessage.builder().type(ChatMessageType.GAMEMESSAGE).value("Party " + party.getPartyId()).build());
+		chatMessageManager.queue(QueuedMessage.builder().type(ChatMessageType.GAMEMESSAGE).value("Local Party " + party.getLocalPartyId()).build());
+		chatMessageManager.queue(QueuedMessage.builder().type(ChatMessageType.GAMEMESSAGE).value("Local ID " + party.getLocalMember().getMemberId()).build());
+		for (PartyMember partyMember : party.getMembers())
+		{
+			chatMessageManager.queue(QueuedMessage.builder().type(ChatMessageType.GAMEMESSAGE).value(" " + partyMember.getName() + " " + partyMember.getMemberId()).build());
+		}
 	}
 
 	@Nullable
@@ -519,7 +544,7 @@ public class PartyPlugin extends Plugin implements KeyListener
 			.build();
 
 		chatMessageManager.queue(QueuedMessage.builder()
-			.type(ChatMessageType.CLANCHAT_INFO)
+			.type(ChatMessageType.FRIENDSCHATNOTIFICATION)
 			.runeLiteFormattedMessage(helpMessage)
 			.build());
 	}

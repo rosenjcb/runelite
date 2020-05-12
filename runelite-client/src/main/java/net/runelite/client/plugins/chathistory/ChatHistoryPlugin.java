@@ -24,8 +24,11 @@
  */
 package net.runelite.client.plugins.chathistory;
 
+import com.google.common.base.Strings;
 import com.google.common.collect.EvictingQueue;
 import com.google.inject.Provides;
+import java.awt.Toolkit;
+import java.awt.datatransfer.StringSelection;
 import java.awt.event.KeyEvent;
 import java.util.ArrayDeque;
 import java.util.Deque;
@@ -34,12 +37,19 @@ import java.util.Queue;
 import javax.inject.Inject;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
+import net.runelite.api.MenuAction;
+import net.runelite.api.MenuEntry;
 import net.runelite.api.ScriptID;
 import net.runelite.api.VarClientInt;
 import net.runelite.api.VarClientStr;
 import net.runelite.api.events.ChatMessage;
+import net.runelite.api.events.MenuOpened;
 import net.runelite.api.events.MenuOptionClicked;
 import net.runelite.api.vars.InputType;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetInfo;
+import static net.runelite.api.widgets.WidgetInfo.TO_CHILD;
+import static net.runelite.api.widgets.WidgetInfo.TO_GROUP;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.chat.ChatMessageManager;
 import net.runelite.client.chat.QueuedMessage;
@@ -50,6 +60,8 @@ import net.runelite.client.input.KeyManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.util.Text;
+import org.apache.commons.lang3.ArrayUtils;
+import org.apache.commons.lang3.StringUtils;
 
 @PluginDescriptor(
 	name = "Chat History",
@@ -58,13 +70,17 @@ import net.runelite.client.util.Text;
 )
 public class ChatHistoryPlugin extends Plugin implements KeyListener
 {
-	private static final String WELCOME_MESSAGE = "Welcome to Old School RuneScape.";
+	private static final String WELCOME_MESSAGE = "Welcome to Old School RuneScape";
 	private static final String CLEAR_HISTORY = "Clear history";
 	private static final String CLEAR_PRIVATE = "<col=ffff00>Private:";
+	private static final String COPY_TO_CLIPBOARD = "Copy to clipboard";
 	private static final int CYCLE_HOTKEY = KeyEvent.VK_TAB;
+	private static final int FRIENDS_MAX_SIZE = 5;
 
 	private Queue<QueuedMessage> messageQueue;
 	private Deque<String> friends;
+
+	private String currentMessage = null;
 
 	@Inject
 	private Client client;
@@ -91,7 +107,7 @@ public class ChatHistoryPlugin extends Plugin implements KeyListener
 	protected void startUp()
 	{
 		messageQueue = EvictingQueue.create(100);
-		friends = new ArrayDeque<>(5);
+		friends = new ArrayDeque<>(FRIENDS_MAX_SIZE + 1);
 		keyManager.registerKeyListener(this);
 	}
 
@@ -102,6 +118,7 @@ public class ChatHistoryPlugin extends Plugin implements KeyListener
 		messageQueue = null;
 		friends.clear();
 		friends = null;
+		currentMessage = null;
 		keyManager.unregisterKeyListener(this);
 	}
 
@@ -110,7 +127,8 @@ public class ChatHistoryPlugin extends Plugin implements KeyListener
 	{
 		// Start sending old messages right after the welcome message, as that is most reliable source
 		// of information that chat history was reset
-		if (chatMessage.getMessage().equals(WELCOME_MESSAGE))
+		ChatMessageType chatMessageType = chatMessage.getType();
+		if (chatMessageType == ChatMessageType.WELCOME && StringUtils.startsWithIgnoreCase(chatMessage.getMessage(), WELCOME_MESSAGE))
 		{
 			if (!config.retainChatHistory())
 			{
@@ -127,22 +145,29 @@ public class ChatHistoryPlugin extends Plugin implements KeyListener
 			return;
 		}
 
-		switch (chatMessage.getType())
+		switch (chatMessageType)
 		{
-			case PRIVATE_MESSAGE_SENT:
-			case PRIVATE_MESSAGE_RECEIVED:
-			case PRIVATE_MESSAGE_RECEIVED_MOD:
+			case PRIVATECHATOUT:
+			case PRIVATECHAT:
+			case MODPRIVATECHAT:
 				final String name = Text.removeTags(chatMessage.getName());
 				// Remove to ensure uniqueness & its place in history
-				friends.remove(name);
+				if (!friends.remove(name))
+				{
+					// If the friend didn't previously exist ensure deque capacity doesn't increase by adding them
+					if (friends.size() >= FRIENDS_MAX_SIZE)
+					{
+						friends.remove();
+					}
+				}
 				friends.add(name);
 				// intentional fall-through
-			case PUBLIC:
-			case PUBLIC_MOD:
-			case CLANCHAT:
-			case GAME:
+			case PUBLICCHAT:
+			case MODCHAT:
+			case FRIENDSCHAT:
+			case CONSOLE:
 				final QueuedMessage queuedMessage = QueuedMessage.builder()
-					.type(chatMessage.getType())
+					.type(chatMessageType)
 					.name(chatMessage.getName())
 					.sender(chatMessage.getSender())
 					.value(nbsp(chatMessage.getMessage()))
@@ -158,6 +183,68 @@ public class ChatHistoryPlugin extends Plugin implements KeyListener
 	}
 
 	@Subscribe
+	public void onMenuOpened(MenuOpened event)
+	{
+		if (event.getMenuEntries().length < 2 || !config.copyToClipboard())
+		{
+			return;
+		}
+
+		// Use second entry as first one can be walk here with transparent chatbox
+		final MenuEntry entry = event.getMenuEntries()[event.getMenuEntries().length - 2];
+
+		if (entry.getType() != MenuAction.CC_OP_LOW_PRIORITY.getId() && entry.getType() != MenuAction.RUNELITE.getId())
+		{
+			return;
+		}
+
+		final int groupId = TO_GROUP(entry.getParam1());
+		final int childId = TO_CHILD(entry.getParam1());
+
+		if (groupId != WidgetInfo.CHATBOX.getGroupId())
+		{
+			return;
+		}
+
+		final Widget widget = client.getWidget(groupId, childId);
+		final Widget parent = widget.getParent();
+
+		if (WidgetInfo.CHATBOX_MESSAGE_LINES.getId() != parent.getId())
+		{
+			return;
+		}
+
+		// Get child id of first chat message static child so we can substract this offset to link to dynamic child
+		// later
+		final int first = WidgetInfo.CHATBOX_FIRST_MESSAGE.getChildId();
+
+		// Convert current message static widget id to dynamic widget id of message node with message contents
+		// When message is right clicked, we are actually right clicking static widget that contains only sender.
+		// The actual message contents are stored in dynamic widgets that follow same order as static widgets.
+		// Every first dynamic widget is message sender and every second one is message contents.
+		final int dynamicChildId = (childId - first) * 2 + 1;
+
+		// Extract and store message contents when menu is opened because dynamic children can change while right click
+		// menu is open and dynamicChildId will be outdated
+		final Widget messageContents = parent.getChild(dynamicChildId);
+		if (messageContents == null)
+		{
+			return;
+		}
+
+		currentMessage = messageContents.getText();
+
+		final MenuEntry menuEntry = new MenuEntry();
+		menuEntry.setOption(COPY_TO_CLIPBOARD);
+		menuEntry.setTarget(entry.getTarget());
+		menuEntry.setType(MenuAction.RUNELITE.getId());
+		menuEntry.setParam0(entry.getParam0());
+		menuEntry.setParam1(entry.getParam1());
+		menuEntry.setIdentifier(entry.getIdentifier());
+		client.setMenuEntries(ArrayUtils.insert(1, client.getMenuEntries(), menuEntry));
+	}
+
+	@Subscribe
 	public void onMenuOptionClicked(MenuOptionClicked event)
 	{
 		String menuOption = event.getMenuOption();
@@ -166,13 +253,19 @@ public class ChatHistoryPlugin extends Plugin implements KeyListener
 		{
 			if (menuOption.startsWith(CLEAR_PRIVATE))
 			{
-				messageQueue.removeIf(e -> e.getType() == ChatMessageType.PRIVATE_MESSAGE_RECEIVED ||
-					e.getType() == ChatMessageType.PRIVATE_MESSAGE_SENT || e.getType() == ChatMessageType.PRIVATE_MESSAGE_RECEIVED_MOD);
+				messageQueue.removeIf(e -> e.getType() == ChatMessageType.PRIVATECHAT ||
+					e.getType() == ChatMessageType.PRIVATECHATOUT || e.getType() == ChatMessageType.MODPRIVATECHAT);
+				friends.clear();
 			}
 			else
 			{
-				messageQueue.removeIf(e -> e.getType() == ChatMessageType.PUBLIC || e.getType() == ChatMessageType.PUBLIC_MOD);
+				messageQueue.removeIf(e -> e.getType() == ChatMessageType.PUBLICCHAT || e.getType() == ChatMessageType.MODCHAT);
 			}
+		}
+		else if (COPY_TO_CLIPBOARD.equals(menuOption) && !Strings.isNullOrEmpty(currentMessage))
+		{
+			final StringSelection stringSelection = new StringSelection(Text.removeTags(currentMessage));
+			Toolkit.getDefaultToolkit().getSystemClipboard().setContents(stringSelection, null);
 		}
 	}
 
